@@ -20,10 +20,10 @@ docker run --rm simple-bev-onnx
 ## Expected Performance
 | Environment | Mean Latency | FPS |
 |-------------|-------------|-----|
-| CPU RORT) | ~394 ms | ~2.5 |
-| CPU (PyTorch) | ~504 ms | ~2.0 |
+| GPU (ORT) | ~394 ms | ~2.5 |
+| GPU (PyTorch) | ~504 ms | ~2.0 |
 | T4 GPU (PyTorch) | ~12 ms | ~86 |
 
 ## Troubleshooting
 - Model not found: run `bash scripts/export.sh` or the Colab notebook
-- Slow CPU: set `export OMP_NUM_THREADS=4`
+- Slow GPU: set `export OMP_NUM_THREADS=4`
