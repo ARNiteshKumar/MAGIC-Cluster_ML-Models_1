@@ -3,9 +3,9 @@ SIMPLE-BEV ONNX EXPORT BENCHMARK REPORT
 Environment: PyTorch 2.9.0+cu128 | ONNX 1.20.1 | ONNX RT 0.24.1
 GPU: Tesla T4 (Google Colab) | ONNX Opset: 17
 
-Latency (GPU vs GPU fair comparison):
-  PyTorch GPU Mean : 504.02 ms  |  FPS: 1.98
-  ONNX RT GPU Mean : 393.70 ms  |  FPS: 2.54
+Latency (CPU vs CPU fair comparison):
+  PyTorch CPU Mean : 504.02 ms  |  FPS: 1.98
+  ONNX RT CPU Mean : 393.70 ms  |  FPS: 2.54
   Speedup          : 1.28x
 
 Numerical Verification:
