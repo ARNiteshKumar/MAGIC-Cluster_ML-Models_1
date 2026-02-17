@@ -52,7 +52,7 @@ simple-bev-onnx/
 
 ### ⭐ Option 1: Full Pipeline (One Command)
 ```bash
-git clone https://github.com/YOUR_USERNAME/simple-bev-onnx.git
+git clone https://github.com/ARNiteshKumar/MAGIC-Cluster_ML-Models_1
 cd simple-bev-onnx
 bash scripts/run_pipeline.sh
 ```
