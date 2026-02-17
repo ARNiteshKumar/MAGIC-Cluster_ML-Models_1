@@ -1,0 +1,36 @@
+# Simple-BEV Configuration
+model:
+  ncams: 6
+  feat_dim: 128
+  bev_h: 200
+  bev_w: 200
+  num_classes: 8
+
+input:
+  height: 224
+  width: 400
+  channels: 3
+
+training:
+  epochs: 50
+  batch_size: 2
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  scheduler: cosine
+  device: cuda
+
+export:
+  onnx_opset: 17
+  optimize: true
+  output_dir: artifacts/
+
+inference:
+  provider: CPUExecutionProvider
+  model_path: artifacts/simple_bev_optimized.onnx
+  warmup_runs: 5
+  benchmark_runs: 50
+
+paths:
+  data_dir: src/data/
+  checkpoint_dir: artifacts/
+  log_dir: logs/
