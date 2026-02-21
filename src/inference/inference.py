@@ -1,20 +1,28 @@
 """
 Simple-BEV Inference & Evaluation Script
 =========================================
-Runs both PyTorch and ONNX inference on nuScenes-style data.
-Outputs:
+Runs both PyTorch and ONNX inference on the **full nuScenes dataset**
+(or synthetic fallback) and produces:
   - BEV segmentation maps with bounding boxes per class
   - Per-class and mean IoU (Intersection over Union)
-  - Per-class and overall accuracy
+  - Per-class and overall pixel accuracy
   - MSC verification (PyTorch vs ONNX numerical comparison)
   - Latency benchmarks for both backends
   - Saved bbox images into output folder
 
-Usage:
-  python src/inference/inference.py --config configs/config.yaml
-  python src/inference/inference.py --config configs/config.yaml --num_samples 16
+Usage (real nuScenes — full dataset validation):
+  python src/inference/inference.py --config configs/config.yaml \
+      --data_root /path/to/nuscenes --version v1.0-trainval --split val
+
+Usage (nuScenes mini split):
+  python src/inference/inference.py --config configs/config.yaml \
+      --data_root /path/to/nuscenes --version v1.0-mini --split mini_val
+
+Usage (synthetic fallback — no dataset needed):
+  python src/inference/inference.py --config configs/config.yaml --synthetic
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -69,7 +77,34 @@ def _load_class_info(cfg: dict):
             CLASS_COLORS = np.array(cfg["classes"]["colors"], dtype=np.uint8)
 
 
-# ============================= DATA LOADER =================================
+# ============================= DATA LOADING ================================
+
+def load_nuscenes_dataset(cfg: dict, data_root: str, version: str,
+                          split: str, max_samples: int = None):
+    """
+    Load the real nuScenes dataset for full validation.
+
+    Returns
+    -------
+    imgs : (N, 6, 3, H, W) float32
+    labels : (N, bev_h, bev_w) int64
+    sample_tokens : list[str]
+    """
+    from src.data.nuscenes_loader import NuScenesLoader
+
+    loader = NuScenesLoader(
+        data_root=data_root,
+        version=version,
+        split=split,
+        img_h=cfg["input"]["height"],
+        img_w=cfg["input"]["width"],
+        bev_h=cfg["model"]["bev_h"],
+        bev_w=cfg["model"]["bev_w"],
+        max_samples=max_samples,
+    )
+    imgs, labels, tokens = loader.load_all()
+    return imgs, labels, tokens
+
 
 def get_synthetic_dataset(cfg: dict, n_samples: int = 64):
     """Generate synthetic nuScenes-style multi-camera images and BEV labels."""
@@ -95,7 +130,7 @@ def extract_bboxes_from_segmentation(pred_map: np.ndarray, num_classes: int,
         min_area: minimum connected-component area to keep
 
     Returns:
-        list of dicts with keys: class_id, class_name, bbox (x, y, w, h), area
+        list of dicts: class_id, class_name, bbox (x, y, w, h), area, centroid
     """
     detections = []
     for cls_id in range(1, num_classes):  # skip background (0)
@@ -113,12 +148,12 @@ def extract_bboxes_from_segmentation(pred_map: np.ndarray, num_classes: int,
             w = stats[comp_id, cv2.CC_STAT_WIDTH]
             h = stats[comp_id, cv2.CC_STAT_HEIGHT]
             detections.append({
-                "class_id": cls_id,
+                "class_id": int(cls_id),
                 "class_name": CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else f"class_{cls_id}",
-                "bbox": (x, y, w, h),
+                "bbox": [int(x), int(y), int(w), int(h)],
                 "area": int(area),
-                "centroid": (float(centroids[comp_id][0]),
-                             float(centroids[comp_id][1])),
+                "centroid": [float(centroids[comp_id][0]),
+                             float(centroids[comp_id][1])],
             })
     return detections
 
@@ -126,19 +161,24 @@ def extract_bboxes_from_segmentation(pred_map: np.ndarray, num_classes: int,
 # ===================== VISUALISATION =======================================
 
 def draw_bev_with_bboxes(pred_map: np.ndarray, detections: list,
-                         title: str = "BEV Prediction"):
+                         title: str = "BEV Prediction",
+                         gt_map: np.ndarray = None):
     """
     Create a coloured BEV segmentation image with bounding boxes overlaid.
+    Optionally shows ground truth side-by-side.
 
     Returns:
         fig: matplotlib Figure
     """
-    H, W = pred_map.shape
-    rgb = CLASS_COLORS[pred_map]  # (H, W, 3)
+    ncols = 2 if gt_map is not None else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, 8))
+    if ncols == 1:
+        axes = [axes]
 
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(rgb)
-    ax.set_title(title, fontsize=14)
+    # --- Prediction panel ---
+    rgb_pred = CLASS_COLORS[pred_map]
+    axes[0].imshow(rgb_pred)
+    axes[0].set_title(title, fontsize=14)
 
     for det in detections:
         x, y, w, h = det["bbox"]
@@ -148,11 +188,11 @@ def draw_bev_with_bboxes(pred_map: np.ndarray, detections: list,
             (x, y), w, h,
             linewidth=2, edgecolor=color, facecolor="none",
             boxstyle="round,pad=0.5")
-        ax.add_patch(rect)
-        ax.text(x, max(y - 2, 0),
-                f"{det['class_name']} ({det['area']}px)",
-                fontsize=7, color="white",
-                bbox=dict(facecolor=color, alpha=0.7, pad=1))
+        axes[0].add_patch(rect)
+        axes[0].text(x, max(y - 2, 0),
+                     f"{det['class_name']} ({det['area']}px)",
+                     fontsize=7, color="white",
+                     bbox=dict(facecolor=color, alpha=0.7, pad=1))
 
     # legend
     handles = []
@@ -161,8 +201,17 @@ def draw_bev_with_bboxes(pred_map: np.ndarray, detections: list,
             continue
         handles.append(mpatches.Patch(
             color=CLASS_COLORS[i].astype(float) / 255.0, label=name))
-    ax.legend(handles=handles, loc="upper right", fontsize=7)
-    ax.axis("off")
+    axes[0].legend(handles=handles, loc="upper right", fontsize=7)
+    axes[0].axis("off")
+
+    # --- GT panel ---
+    if gt_map is not None:
+        rgb_gt = CLASS_COLORS[gt_map]
+        axes[1].imshow(rgb_gt)
+        axes[1].set_title("Ground Truth", fontsize=14)
+        axes[1].legend(handles=handles, loc="upper right", fontsize=7)
+        axes[1].axis("off")
+
     plt.tight_layout()
     return fig
 
@@ -219,6 +268,16 @@ def compute_accuracy(pred: np.ndarray, gt: np.ndarray, num_classes: int):
     return overall_acc, per_class_acc
 
 
+def compute_confusion_matrix(pred: np.ndarray, gt: np.ndarray, num_classes: int):
+    """Compute a confusion matrix (num_classes x num_classes)."""
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for gt_cls in range(num_classes):
+        for pred_cls in range(num_classes):
+            cm[gt_cls, pred_cls] = int(
+                np.logical_and(gt == gt_cls, pred == pred_cls).sum())
+    return cm
+
+
 # ===================== MSC VERIFICATION ====================================
 
 def msc_verification(pytorch_output: np.ndarray, onnx_output: np.ndarray):
@@ -263,7 +322,7 @@ def msc_verification(pytorch_output: np.ndarray, onnx_output: np.ndarray):
 
 def pytorch_inference(imgs_np: np.ndarray, cfg: dict):
     """
-    Run PyTorch inference.
+    Run PyTorch inference on all samples.
 
     Args:
         imgs_np: (N, 6, 3, H, W) float32 numpy array
@@ -312,7 +371,7 @@ def pytorch_inference(imgs_np: np.ndarray, cfg: dict):
 
 def onnx_inference(imgs_np: np.ndarray, cfg: dict):
     """
-    Run ONNX Runtime inference.
+    Run ONNX Runtime inference on all samples.
 
     Args:
         imgs_np: (N, 6, 3, H, W) float32 numpy array
@@ -328,7 +387,6 @@ def onnx_inference(imgs_np: np.ndarray, cfg: dict):
     model_path = cfg["inference"].get("model_path",
                                       "artifacts/simple_bev_optimized.onnx")
     if not os.path.exists(model_path):
-        # fallback to non-optimized
         model_path = model_path.replace("_optimized", "")
     if not os.path.exists(model_path):
         raise FileNotFoundError(
@@ -362,13 +420,19 @@ def onnx_inference(imgs_np: np.ndarray, cfg: dict):
 # ===================== REPORT GENERATION ===================================
 
 def generate_report(pytorch_metrics: dict, onnx_metrics: dict,
-                    msc: dict, cfg: dict, output_dir: str):
+                    msc: dict, cfg: dict, output_dir: str,
+                    data_source: str, num_samples: int):
     """Write a comprehensive evaluation report to a text file."""
     num_classes = cfg["model"]["num_classes"]
     lines = []
     lines.append("=" * 70)
     lines.append("  SIMPLE-BEV INFERENCE & EVALUATION REPORT")
     lines.append("=" * 70)
+    lines.append("")
+    lines.append(f"  Data source  : {data_source}")
+    lines.append(f"  Num samples  : {num_samples}")
+    lines.append(f"  BEV grid     : {cfg['model']['bev_h']} x {cfg['model']['bev_w']}")
+    lines.append(f"  Num classes  : {num_classes}")
     lines.append("")
 
     # ----- Class Information -----
@@ -444,15 +508,34 @@ def generate_report(pytorch_metrics: dict, onnx_metrics: dict,
     return report, report_path
 
 
+def save_detections_json(all_detections: list, output_path: str):
+    """Save all per-sample detections to a JSON file."""
+    with open(output_path, "w") as f:
+        json.dump(all_detections, f, indent=2)
+
+
 # ===================== MAIN ================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Simple-BEV Inference with bbox output, IoU metrics & MSC verification")
+        description="Simple-BEV full dataset validation with bbox, IoU & MSC")
     parser.add_argument("--config", default="configs/config.yaml",
                         help="Path to config YAML")
+    # --- nuScenes dataset options ---
+    parser.add_argument("--data_root", default=None,
+                        help="Path to nuScenes dataset root (enables real data)")
+    parser.add_argument("--version", default="v1.0-mini",
+                        help="nuScenes version: v1.0-mini, v1.0-trainval, v1.0-test")
+    parser.add_argument("--split", default="mini_val",
+                        help="Dataset split: mini_train, mini_val, train, val, test")
+    parser.add_argument("--max_samples", type=int, default=None,
+                        help="Cap number of samples (None=all)")
+    # --- Synthetic fallback ---
+    parser.add_argument("--synthetic", action="store_true",
+                        help="Force synthetic data (ignore --data_root)")
     parser.add_argument("--num_samples", type=int, default=None,
-                        help="Number of synthetic samples (overrides config)")
+                        help="Number of synthetic samples (default from config)")
+    # --- General ---
     parser.add_argument("--provider", default=None,
                         help="ONNX Runtime provider (overrides config)")
     parser.add_argument("--output_dir", default=None,
@@ -463,8 +546,6 @@ def main():
     _load_class_info(cfg)
 
     num_classes = cfg["model"]["num_classes"]
-    num_samples = (args.num_samples
-                   or cfg.get("evaluation", {}).get("num_synthetic_samples", 64))
     output_dir = (args.output_dir
                   or cfg.get("inference", {}).get("output_dir", "output_bev_results/"))
     min_area = cfg.get("inference", {}).get("min_component_area", 10)
@@ -477,87 +558,154 @@ def main():
     os.makedirs(os.path.join(output_dir, "onnx"), exist_ok=True)
 
     print("=" * 60)
-    print("  Simple-BEV Inference & Evaluation")
+    print("  Simple-BEV Full Dataset Validation")
     print("=" * 60)
 
-    # ---- 1. Generate common input ----
-    print(f"\n[1/5] Generating {num_samples} synthetic nuScenes-style samples ...")
-    imgs, gt_labels = get_synthetic_dataset(cfg, n_samples=num_samples)
+    # ---- 1. Load data ----
+    use_nuscenes = (args.data_root is not None) and (not args.synthetic)
+
+    if use_nuscenes:
+        data_source = f"nuScenes {args.version} / {args.split}"
+        print(f"\n[1/6] Loading nuScenes dataset: {data_source} ...")
+        print(f"  data_root : {args.data_root}")
+        imgs, gt_labels, sample_tokens = load_nuscenes_dataset(
+            cfg, args.data_root, args.version, args.split, args.max_samples)
+        num_samples = imgs.shape[0]
+    else:
+        num_samples = (args.num_samples
+                       or cfg.get("evaluation", {}).get("num_synthetic_samples", 64))
+        data_source = f"Synthetic ({num_samples} samples)"
+        print(f"\n[1/6] Generating {num_samples} synthetic nuScenes-style samples ...")
+        print("  TIP: Use --data_root /path/to/nuscenes for real dataset validation")
+        imgs, gt_labels = get_synthetic_dataset(cfg, n_samples=num_samples)
+        sample_tokens = [f"synthetic_{i:06d}" for i in range(num_samples)]
+
+    print(f"  Data source  : {data_source}")
     print(f"  Input shape  : {imgs.shape}  (N, cams, C, H, W)")
     print(f"  Labels shape : {gt_labels.shape}  (N, bev_H, bev_W)")
+    print(f"  GT classes present: {np.unique(gt_labels).tolist()}")
 
     # ---- 2. PyTorch inference ----
-    print("\n[2/5] Running PyTorch inference ...")
+    print("\n[2/6] Running PyTorch inference ...")
     pt_logits, pt_latency = pytorch_inference(imgs, cfg)
     pt_preds = pt_logits.argmax(axis=1)  # (N, H, W)
     print(f"  Output shape : {pt_logits.shape}")
     print(f"  Mean latency : {pt_latency:.2f} ms/sample")
 
     # ---- 3. ONNX inference ----
-    print("\n[3/5] Running ONNX Runtime inference ...")
+    print("\n[3/6] Running ONNX Runtime inference ...")
     ox_logits, ox_latency = onnx_inference(imgs, cfg)
     ox_preds = ox_logits.argmax(axis=1)  # (N, H, W)
     print(f"  Output shape : {ox_logits.shape}")
     print(f"  Mean latency : {ox_latency:.2f} ms/sample")
 
-    # ---- 4. Compute metrics ----
-    print("\n[4/5] Computing evaluation metrics ...")
-
-    # MSC verification
+    # ---- 4. MSC verification ----
+    print("\n[4/6] MSC Verification (PyTorch vs ONNX) ...")
     msc = msc_verification(pt_logits, ox_logits)
-    print(f"  MSC status             : {msc['status']}")
     print(f"  Max diff               : {msc['max_diff']:.2e}")
+    print(f"  Mean diff              : {msc['mean_diff']:.2e}")
+    print(f"  Cosine similarity      : {msc['cosine_similarity']:.8f}")
     print(f"  Prediction agreement   : {msc['prediction_agreement_pct']:.2f}%")
+    print(f"  Status                 : {msc['status']}")
+
+    # ---- 5. Compute evaluation metrics ----
+    print("\n[5/6] Computing evaluation metrics (IoU + Accuracy) ...")
 
     # PyTorch metrics vs ground truth
     pt_iou_per_class, pt_miou = compute_iou_per_class(pt_preds, gt_labels, num_classes)
     pt_overall_acc, pt_class_acc = compute_accuracy(pt_preds, gt_labels, num_classes)
+    pt_cm = compute_confusion_matrix(pt_preds, gt_labels, num_classes)
 
     # ONNX metrics vs ground truth
     ox_iou_per_class, ox_miou = compute_iou_per_class(ox_preds, gt_labels, num_classes)
     ox_overall_acc, ox_class_acc = compute_accuracy(ox_preds, gt_labels, num_classes)
+    ox_cm = compute_confusion_matrix(ox_preds, gt_labels, num_classes)
 
-    print(f"\n  PyTorch  =>  mIoU: {pt_miou*100:.2f}%  Accuracy: {pt_overall_acc*100:.2f}%")
-    print(f"  ONNX RT  =>  mIoU: {ox_miou*100:.2f}%  Accuracy: {ox_overall_acc*100:.2f}%")
+    print(f"\n  === PYTORCH RESULTS ===")
+    print(f"  Overall accuracy  : {pt_overall_acc * 100:.2f}%")
+    print(f"  Mean IoU (mIoU)   : {pt_miou * 100:.2f}%")
+    print(f"  Per-class IoU:")
+    for name, val in pt_iou_per_class.items():
+        v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
+        print(f"    {name:<20s}: {v}")
 
-    # ---- 5. Extract bboxes and save images ----
-    print(f"\n[5/5] Extracting bounding boxes & saving visualisations to {output_dir}/ ...")
+    print(f"\n  === ONNX RESULTS ===")
+    print(f"  Overall accuracy  : {ox_overall_acc * 100:.2f}%")
+    print(f"  Mean IoU (mIoU)   : {ox_miou * 100:.2f}%")
+    print(f"  Per-class IoU:")
+    for name, val in ox_iou_per_class.items():
+        v = f"{val * 100:.2f}%" if not np.isnan(val) else "N/A"
+        print(f"    {name:<20s}: {v}")
+
+    # ---- 6. Extract bboxes and save images ----
+    print(f"\n[6/6] Extracting bounding boxes & saving to {output_dir}/ ...")
 
     pt_total_bboxes = 0
     ox_total_bboxes = 0
+    pt_all_detections = []
+    ox_all_detections = []
 
-    max_save = min(num_samples, 20)  # save at most 20 images
-    for i in range(max_save):
+    max_save = min(num_samples, 50)  # save at most 50 images
+    for i in range(num_samples):
         # PyTorch bboxes
         pt_dets = extract_bboxes_from_segmentation(pt_preds[i], num_classes, min_area)
         pt_total_bboxes += len(pt_dets)
-        fig_pt = draw_bev_with_bboxes(
-            pt_preds[i], pt_dets,
-            title=f"PyTorch BEV #{i}  ({len(pt_dets)} detections)")
-        fig_pt.savefig(os.path.join(output_dir, "pytorch", f"bev_bbox_{i:04d}.png"),
-                       dpi=120, bbox_inches="tight")
-        plt.close(fig_pt)
+        pt_all_detections.append({
+            "sample_idx": i,
+            "sample_token": sample_tokens[i],
+            "num_detections": len(pt_dets),
+            "detections": pt_dets,
+        })
 
         # ONNX bboxes
         ox_dets = extract_bboxes_from_segmentation(ox_preds[i], num_classes, min_area)
         ox_total_bboxes += len(ox_dets)
-        fig_ox = draw_bev_with_bboxes(
-            ox_preds[i], ox_dets,
-            title=f"ONNX BEV #{i}  ({len(ox_dets)} detections)")
-        fig_ox.savefig(os.path.join(output_dir, "onnx", f"bev_bbox_{i:04d}.png"),
-                       dpi=120, bbox_inches="tight")
-        plt.close(fig_ox)
+        ox_all_detections.append({
+            "sample_idx": i,
+            "sample_token": sample_tokens[i],
+            "num_detections": len(ox_dets),
+            "detections": ox_dets,
+        })
 
-    # count remaining bboxes for samples not saved as images
-    for i in range(max_save, num_samples):
-        pt_total_bboxes += len(
-            extract_bboxes_from_segmentation(pt_preds[i], num_classes, min_area))
-        ox_total_bboxes += len(
-            extract_bboxes_from_segmentation(ox_preds[i], num_classes, min_area))
+        # Save images (capped at max_save)
+        if i < max_save:
+            fig_pt = draw_bev_with_bboxes(
+                pt_preds[i], pt_dets,
+                title=f"PyTorch BEV #{i}  ({len(pt_dets)} det)",
+                gt_map=gt_labels[i])
+            fig_pt.savefig(
+                os.path.join(output_dir, "pytorch", f"bev_bbox_{i:04d}.png"),
+                dpi=120, bbox_inches="tight")
+            plt.close(fig_pt)
+
+            fig_ox = draw_bev_with_bboxes(
+                ox_preds[i], ox_dets,
+                title=f"ONNX BEV #{i}  ({len(ox_dets)} det)",
+                gt_map=gt_labels[i])
+            fig_ox.savefig(
+                os.path.join(output_dir, "onnx", f"bev_bbox_{i:04d}.png"),
+                dpi=120, bbox_inches="tight")
+            plt.close(fig_ox)
+
+    # Save detections JSON
+    save_detections_json(pt_all_detections,
+                         os.path.join(output_dir, "pytorch_detections.json"))
+    save_detections_json(ox_all_detections,
+                         os.path.join(output_dir, "onnx_detections.json"))
+
+    # Save confusion matrices
+    np.savetxt(os.path.join(output_dir, "pytorch_confusion_matrix.csv"),
+               pt_cm, delimiter=",", fmt="%d",
+               header=",".join(CLASS_NAMES[:num_classes]))
+    np.savetxt(os.path.join(output_dir, "onnx_confusion_matrix.csv"),
+               ox_cm, delimiter=",", fmt="%d",
+               header=",".join(CLASS_NAMES[:num_classes]))
 
     print(f"  PyTorch total bboxes : {pt_total_bboxes}")
     print(f"  ONNX total bboxes    : {ox_total_bboxes}")
-    print(f"  Images saved         : {max_save} per backend")
+    print(f"  Images saved         : {min(num_samples, max_save)} per backend")
+    print(f"  Detections JSON      : {output_dir}/pytorch_detections.json")
+    print(f"                         {output_dir}/onnx_detections.json")
 
     # ---- Build metrics dicts ----
     pytorch_metrics = {
@@ -578,12 +726,15 @@ def main():
     }
 
     # ---- Generate report ----
-    report, report_path = generate_report(pytorch_metrics, onnx_metrics,
-                                          msc, cfg, output_dir)
+    report, report_path = generate_report(
+        pytorch_metrics, onnx_metrics, msc, cfg, output_dir,
+        data_source, num_samples)
     print(f"\n{'=' * 60}")
     print(report)
-    print(f"\nReport saved to: {report_path}")
-    print("Inference complete!")
+    print(f"\nReport saved to        : {report_path}")
+    print(f"Confusion matrices     : {output_dir}/pytorch_confusion_matrix.csv")
+    print(f"                         {output_dir}/onnx_confusion_matrix.csv")
+    print("Inference & evaluation complete!")
 
 
 if __name__ == "__main__":

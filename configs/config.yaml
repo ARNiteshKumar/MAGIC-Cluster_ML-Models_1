@@ -35,7 +35,18 @@ inference:
   confidence_threshold: 0.5
   min_component_area: 10
 
-# Class definitions for BEV segmentation
+# nuScenes dataset configuration
+# Download from https://www.nuscenes.org/ and set data_root below
+nuscenes:
+  data_root: /data/nuscenes          # Path to extracted nuScenes dataset
+  version: v1.0-trainval             # v1.0-mini | v1.0-trainval | v1.0-test
+  split: val                         # mini_train | mini_val | train | val | test
+  # BEV ground-truth projection settings
+  bev_x_range: [-50.0, 50.0]        # metres, left-right
+  bev_y_range: [-50.0, 50.0]        # metres, front-back
+  bev_resolution: 0.5               # metres per pixel
+
+# Class definitions for BEV segmentation (8 nuScenes classes)
 classes:
   names:
     - background
