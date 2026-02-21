@@ -27,8 +27,38 @@ export:
 inference:
   provider: CPUExecutionProvider
   model_path: artifacts/simple_bev_optimized.onnx
+  pytorch_model_path: artifacts/simple_bev.pt
   warmup_runs: 5
   benchmark_runs: 50
+  output_dir: output_bev_results/
+  save_images: true
+  confidence_threshold: 0.5
+  min_component_area: 10
+
+# Class definitions for BEV segmentation
+classes:
+  names:
+    - background
+    - drivable_surface
+    - vehicle
+    - pedestrian
+    - cyclist
+    - road_marking
+    - static_obstacle
+    - other
+  colors:
+    - [0, 0, 0]           # background - black
+    - [128, 128, 128]     # drivable_surface - gray
+    - [255, 0, 0]         # vehicle - red
+    - [0, 255, 0]         # pedestrian - green
+    - [0, 0, 255]         # cyclist - blue
+    - [255, 255, 0]       # road_marking - yellow
+    - [255, 165, 0]       # static_obstacle - orange
+    - [128, 0, 128]       # other - purple
+
+evaluation:
+  iou_threshold: 0.5
+  num_synthetic_samples: 64
 
 paths:
   data_dir: src/data/
